@@ -1,0 +1,65 @@
+name: Sunday Bulletin Checker
+
+on:
+  # ── Scheduled trigger: every Sunday at 12:00 PM Eastern (17:00 UTC) ────────
+  # Bulletins are typically posted Sunday morning — noon gives time to appear.
+  # Adjust the UTC hour if needed (ET = UTC-5 in winter, UTC-4 in summer).
+  schedule:
+    - cron: "0 17 * * 0"   # Every Sunday at 17:00 UTC (12:00 PM ET)
+
+  # ── Manual trigger: run from GitHub Actions tab at any time ───────────────
+  workflow_dispatch:
+
+jobs:
+  check-bulletin:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out the repo so the script and state file are available
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3. Install dependencies
+      - name: Install dependencies
+        run: |
+          pip install \
+            requests \
+            beautifulsoup4 \
+            pypdf \
+            PyJWT[crypto] \
+            httpx[http2] \
+            cryptography
+
+      # 4. Restore the last-checked state file from cache
+      #    This prevents re-alerting on the same bulletin after each run.
+      - name: Restore bulletin state cache
+        uses: actions/cache@v4
+        with:
+          path: last_bulletin.json
+          key: bulletin-state-${{ runner.os }}
+          restore-keys: |
+            bulletin-state-
+
+      # 5. Run the checker script
+      - name: Run bulletin checker
+        env:
+          APNS_KEY_ID:       ${{ secrets.APNS_KEY_ID }}
+          APNS_TEAM_ID:      ${{ secrets.APNS_TEAM_ID }}
+          APNS_BUNDLE_ID:    ${{ secrets.APNS_BUNDLE_ID }}
+          APNS_AUTH_KEY:     ${{ secrets.APNS_AUTH_KEY }}
+          APNS_DEVICE_TOKEN: ${{ secrets.APNS_DEVICE_TOKEN }}
+          APNS_PRODUCTION:   ${{ secrets.APNS_PRODUCTION }}
+        run: python check_bulletin.py
+
+      # 6. Save updated state back to cache so next run knows what was checked
+      - name: Save bulletin state cache
+        uses: actions/cache@v4
+        with:
+          path: last_bulletin.json
+          key: bulletin-state-${{ runner.os }}
