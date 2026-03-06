@@ -3,7 +3,7 @@
 Triumph of the Holy Cross Parish — Bulletin Checker
 Constructs the bulletin PDF URL directly from the current Sunday's date.
 Bulletins are hosted at container.parishesonline.com — no scraping needed.
-If names are found, sends an Apple Push Notification (APNs).
+If names are found, sends an Apple Push Notification (APNs) to all devices.
 """
 
 import os
@@ -20,7 +20,6 @@ from pypdf import PdfReader
 # ── Configuration ────────────────────────────────────────────────────────────
 
 # Parish bulletin base URL — pattern: YYYYMMDD + B.pdf
-# Parish ID 14/1225 confirmed from parishesonline.com search results
 BULLETIN_BASE_URL = "https://container.parishesonline.com/bulletins/14/1225/"
 
 SEARCH_NAMES = ["Hugh Docherty", "Docherty", "Teschke"]
@@ -31,7 +30,13 @@ APNS_KEY_ID    = os.environ["APNS_KEY_ID"]
 APNS_TEAM_ID   = os.environ["APNS_TEAM_ID"]
 APNS_BUNDLE_ID = os.environ["APNS_BUNDLE_ID"]
 APNS_AUTH_KEY  = os.environ["APNS_AUTH_KEY"]
-DEVICE_TOKEN   = os.environ["APNS_DEVICE_TOKEN"]
+
+# Supports one token or multiple tokens separated by newlines in the secret
+DEVICE_TOKENS = [
+    t.strip()
+    for t in os.environ["APNS_DEVICE_TOKEN"].split("\n")
+    if t.strip()
+]
 
 APNS_PRODUCTION = os.environ.get("APNS_PRODUCTION", "false").lower() == "true"
 
@@ -39,21 +44,18 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; BulletinChecker/1.0)"
 }
 
-# ── Date helpers ─────────────────────────────────────────────────────────────
+# ── Date helpers ──────────────────────────────────────────────────────────────
 
 def get_this_sunday() -> datetime:
-    """Return today's date if Sunday, otherwise the most recent past Sunday."""
+    """Return today if Sunday, otherwise the most recent past Sunday."""
     today = datetime.now(timezone.utc)
-    # weekday(): Monday=0 … Sunday=6
     days_since_sunday = (today.weekday() + 1) % 7
     return today - timedelta(days=days_since_sunday)
 
 
 def build_bulletin_url(sunday: datetime) -> str:
-    """Build the direct PDF URL for a given Sunday's bulletin."""
-    date_str = sunday.strftime("%Y%m%d")   # e.g. 20250302
-    url = f"{BULLETIN_BASE_URL}{date_str}B.pdf"
-    return url
+    date_str = sunday.strftime("%Y%m%d")
+    return f"{BULLETIN_BASE_URL}{date_str}B.pdf"
 
 
 # ── State helpers ─────────────────────────────────────────────────────────────
@@ -73,10 +75,7 @@ def save_state(state: dict):
 # ── PDF helpers ───────────────────────────────────────────────────────────────
 
 def download_pdf(url: str) -> bytes | None:
-    """
-    Download the bulletin PDF. Returns None if the file doesn't exist yet
-    (404) so the caller can retry next week. Raises on other errors.
-    """
+    """Download the bulletin PDF. Returns None if not posted yet (404)."""
     print(f"Trying bulletin URL: {url}")
     resp = requests.get(url, headers=HEADERS, timeout=30)
 
@@ -102,16 +101,16 @@ def search_names(text: str) -> list[str]:
 # ── APNs ──────────────────────────────────────────────────────────────────────
 
 def build_apns_jwt() -> str:
-    token = jwt.encode(
+    return jwt.encode(
         {"iss": APNS_TEAM_ID, "iat": int(time.time())},
         APNS_AUTH_KEY,
         algorithm="ES256",
         headers={"kid": APNS_KEY_ID},
     )
-    return token
 
 
-def send_push(matched_names: list[str], bulletin_url: str):
+def send_push(matched_names: list[str], bulletin_url: str, device_token: str):
+    """Send a push notification to a single device token."""
     import httpx
 
     host = "api.push.apple.com" if APNS_PRODUCTION else "api.sandbox.push.apple.com"
@@ -136,20 +135,26 @@ def send_push(matched_names: list[str], bulletin_url: str):
         "apns-priority":  "10",
     }
 
-    print(f"Sending push to APNs ({host})…")
+    print(f"  Sending to token: {device_token[:12]}…")
     with httpx.Client(http2=True) as client:
         resp = client.post(
-            f"https://{host}/3/device/{DEVICE_TOKEN}",
+            f"https://{host}/3/device/{device_token}",
             json=payload,
             headers=headers,
             timeout=30,
         )
 
     if resp.status_code == 200:
-        print("✅ Push notification sent!")
+        print("  ✅ Sent!")
     else:
-        print(f"❌ APNs error {resp.status_code}: {resp.text}")
-        sys.exit(1)
+        print(f"  ❌ APNs error {resp.status_code}: {resp.text}")
+
+
+def send_push_to_all(matched_names: list[str], bulletin_url: str):
+    """Send push notifications to every registered device."""
+    print(f"\nSending push to {len(DEVICE_TOKENS)} device(s)…")
+    for token in DEVICE_TOKENS:
+        send_push(matched_names, bulletin_url, token)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -174,9 +179,9 @@ def main():
     # 3. Download the PDF (may not be posted yet)
     pdf_bytes = download_pdf(bulletin_url)
     if pdf_bytes is None:
-        return   # 404 — bulletin not up yet, try again next Sunday
+        return
 
-    # 4. Skip if content is identical to last week's (shouldn't happen, but safe)
+    # 4. Skip if content is identical to last run
     bulletin_hash = hashlib.md5(pdf_bytes).hexdigest()
     if state.get("last_checked_hash") == bulletin_hash:
         print("Bulletin content unchanged. Nothing to do.")
@@ -190,11 +195,11 @@ def main():
 
     if found:
         print(f"🎯 Match found: {found}")
-        send_push(found, bulletin_url)
+        send_push_to_all(found, bulletin_url)
     else:
         print(f"No matches for: {SEARCH_NAMES}")
 
-    # 6. Save state so we don't re-check the same bulletin
+    # 6. Save state
     save_state({
         "last_checked_url":  bulletin_url,
         "last_checked_hash": bulletin_hash,
